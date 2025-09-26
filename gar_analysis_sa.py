@@ -2,9 +2,9 @@
 ----------------------------------------------------------------------------------------------------------------
     PYTHON SCRIPT: gar_analysis.py
 
-    Author:       BCTS TOC - Graydon Shevchenko
-    Purpose:      Tool used to run GAR and LRMP landbase analysis.
-    Date Created: January 10, 2022
+    Author:       SA GIS - Ostap Fedyshyn
+    Purpose:      Tool used to run GAR landbase analysis (and LRMP).
+    Date Created: September 26, 2025
 ----------------------------------------------------------------------------------------------------------------
 """
 
@@ -19,6 +19,8 @@ import logging
 from argparse import ArgumentParser
 from datetime import datetime as dt, timedelta
 from collections import defaultdict
+
+sys.path.insert(0, r"V:\srm\wml\Workarea\ofedyshy\Projects\Selkirk Biodiversity Project\scripts\github\gar_analysis")
 
 # Import classes
 sys.path.insert(1, r'\\spatialfiles2.bcgov\work\FOR\RSI\TOC\Projects\ESRI_Scripts\Python_Repository')
@@ -938,12 +940,147 @@ class GARAnalysis:
 
         if road_inputs:
             arcpy.Merge_management(inputs=road_inputs, output=self.fc_road_merge)
-            arcpy.Buffer_analysis(
-                in_features=self.fc_road_merge,
-                out_feature_class=self.fc_road_buffer,
-                buffer_distance_or_field="10 Meters",
-                dissolve_option="NONE"
-            )
+            
+            #arcpy.Buffer_analysis(
+            #    in_features=self.fc_road_merge,
+            #    out_feature_class=self.fc_road_buffer,
+            #    buffer_distance_or_field="10 Meters",
+            #    dissolve_option="NONE"
+            #)
+
+
+            self.logger.info('Building road right-of-ways.')
+
+            # 0) Decide if we even have road inputs
+            road_inputs = []
+            for fc in (self.fc_mot_roads, self.fc_ften_roads):
+                if arcpy.Exists(fc):
+                    try:
+                        if int(arcpy.GetCount_management(fc).getOutput(0)) > 0:
+                            road_inputs.append(fc)
+                    except Exception:
+                        road_inputs.append(fc)
+
+            if not road_inputs:
+                self.logger.info("No road features found within the AOI/cells; skipping road ROW dissolve.")
+            else:
+                # 1) Merge + clean
+                if arcpy.Exists(self.fc_road_merge):
+                    try: arcpy.Delete_management(self.fc_road_merge)
+                    except: pass
+                arcpy.Merge_management(inputs=road_inputs, output=self.fc_road_merge)
+
+                roads_clean = os.path.join(self.scratch_gdb, 'roads_clean')
+                if arcpy.Exists(roads_clean):
+                    try: arcpy.Delete_management(roads_clean)
+                    except: pass
+
+                lyr = arcpy.MakeFeatureLayer_management(self.fc_road_merge, 'roads_lyr')
+                arcpy.SelectLayerByAttribute_management(lyr, 'NEW_SELECTION', "Shape IS NOT NULL")
+                try:
+                    # Works in projected data; harmless if the field name differs
+                    arcpy.SelectLayerByAttribute_management(lyr, 'SUBSET_SELECTION', "Shape_Length > 0")
+                except Exception:
+                    pass
+                arcpy.CopyFeatures_management(lyr, roads_clean)
+                arcpy.Delete_management(lyr)
+
+                try:
+                    arcpy.RepairGeometry_management(roads_clean, "DELETE_NULL")
+                except Exception as e:
+                    self.logger.warning(f"RepairGeometry on roads_clean: {e}")
+
+                # 2) Buffer – robust cascade
+                if arcpy.Exists(self.fc_road_buffer):
+                    try: arcpy.Delete_management(self.fc_road_buffer)
+                    except: pass
+
+                # Always use planar in 3005
+                arcpy.env.outputCoordinateSystem = arcpy.SpatialReference(3005)
+
+                # 2a) Prefer PairwiseBuffer (handles many edge cases)
+                try:
+                    arcpy.analysis.PairwiseBuffer(
+                        in_features=roads_clean,
+                        out_feature_class=self.fc_road_buffer,
+                        buffer_distance_or_field="10 Meters",
+                        dissolve_option="NONE"
+                    )
+                    self.logger.info("PairwiseBuffer succeeded for road ROWs.")
+                except Exception as e1:
+                    self.logger.warning(f"PairwiseBuffer failed: {e1}; trying standard Buffer.")
+                    # 2b) Standard Buffer
+                    try:
+                        arcpy.Buffer_analysis(
+                            in_features=roads_clean,
+                            out_feature_class=self.fc_road_buffer,
+                            buffer_distance_or_field="10 Meters",
+                            line_side="FULL", line_end_type="ROUND",
+                            dissolve_option="NONE", dissolve_field=None,
+                            method="PLANAR"
+                        )
+                        self.logger.info("Standard Buffer succeeded for road ROWs.")
+                    except Exception as e2:
+                        self.logger.warning(f"Standard Buffer failed: {e2}; trying per-source fallback.")
+                        # 2c) Per-source fallback – isolate the bad dataset
+                        tmp_bufs = []
+                        for tag, src in (("mot", self.fc_mot_roads), ("ften", self.fc_ften_roads)):
+                            try:
+                                if not (arcpy.Exists(src) and int(arcpy.GetCount_management(src).getOutput(0)) > 0):
+                                    continue
+                                csrc = os.path.join(self.scratch_gdb, f"{tag}_clean")
+                                if arcpy.Exists(csrc):
+                                    try: arcpy.Delete_management(csrc)
+                                    except: pass
+                                arcpy.CopyFeatures_management(src, csrc)
+                                try:
+                                    arcpy.RepairGeometry_management(csrc, "DELETE_NULL")
+                                except Exception:
+                                    pass
+                                bout = os.path.join(self.scratch_gdb, f"{tag}_buf")
+                                if arcpy.Exists(bout):
+                                    try: arcpy.Delete_management(bout)
+                                    except: pass
+                                # Pairwise first, then Buffer as a sub-fallback
+                                try:
+                                    arcpy.analysis.PairwiseBuffer(csrc, bout, "10 Meters", "NONE")
+                                except Exception:
+                                    arcpy.Buffer_analysis(csrc, bout, "10 Meters", "FULL", "ROUND", "NONE", None, "PLANAR")
+                                tmp_bufs.append(bout)
+                            except Exception as e3:
+                                self.logger.warning(f"Per-source buffer failed for {tag}: {e3}")
+
+                        if tmp_bufs:
+                            arcpy.Merge_management(tmp_bufs, self.fc_road_buffer)
+                        else:
+                            self.logger.warning("All road buffer attempts failed; skipping road ROWs.")
+                            self.fc_road_buffer = None
+
+                # 3) Tag + dissolve only if we have polygons
+                if self.fc_road_buffer and arcpy.Exists(self.fc_road_buffer):
+                    try:
+                        if int(arcpy.GetCount_management(self.fc_road_buffer).getOutput(0)) > 0:
+                            if self.fld_road_buffer not in [f.name for f in arcpy.ListFields(self.fc_road_buffer)]:
+                                arcpy.AddField_management(self.fc_road_buffer, self.fld_road_buffer, "TEXT", field_length=3)
+                            with arcpy.da.UpdateCursor(self.fc_road_buffer, [self.fld_road_buffer]) as cur:
+                                for row in cur:
+                                    row[0] = "YES"
+                                    cur.updateRow(row)
+                            # Dissolve to a single multipart
+                            arcpy.Dissolve_management(
+                                in_features=self.fc_road_buffer,
+                                out_feature_class=self.fc_road_dissolve,
+                                dissolve_field=self.fld_road_buffer,
+                                multi_part="SINGLE_PART"
+                            )
+                        else:
+                            self.logger.info("road_buffer is empty; skipping ROW dissolve.")
+                    except Exception as e:
+                        self.logger.warning(f"Road ROW dissolve/tag skipped: {e}")
+
+            #----------------------------------------------------------------------------------------------------
+
+
             # Tag, then dissolve to a single multipart
             if self.fld_road_buffer not in [f.name for f in arcpy.ListFields(self.fc_road_buffer)]:
                 arcpy.AddField_management(self.fc_road_buffer, self.fld_road_buffer, "TEXT", field_length=3)
