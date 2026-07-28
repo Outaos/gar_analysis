@@ -28,6 +28,9 @@ from environment import Environment
 
 from util.gar_classes import GARInput, GARConfig, SICReplacement
 from gar.gar_4001 import Gar4001
+from gar.gar_8007 import Gar8007
+from gar.gar_8008 import Gar8008
+
 from gar.gar_4007 import Gar4007
 from gar.gar_4010 import Gar4010
 from gar.gar_8001 import Gar8001
@@ -111,12 +114,16 @@ def get_input_parameters():
             gar        = arcpy.GetParameterAsText(0)
             out_gdb    = arcpy.GetParameterAsText(1)
             out_fld    = arcpy.GetParameterAsText(2)
-            bec        = arcpy.GetParameterAsText(3) or "CURRENT"
-            aoi_fc     = arcpy.GetParameterAsText(4) or None
-            b_un       = arcpy.GetParameterAsText(5)
-            b_pw       = arcpy.GetParameterAsText(6)
-            log_level  = arcpy.GetParameterAsText(7) or "INFO"
-            log_dir    = arcpy.GetParameterAsText(8) or None
+            bec        = "CURRENT"
+            aoi_fc     = arcpy.GetParameterAsText(3) or None
+            b_un       = arcpy.GetParameterAsText(4)
+            b_pw       = arcpy.GetParameterAsText(5)
+            log_level  = arcpy.GetParameterAsText(6) or "INFO"
+            #log_dir    = arcpy.GetParameterAsText(7) or None
+
+            # Automatically create a Log folder inside the base output folder.
+            log_dir = os.path.join(out_fld, "Log")
+            os.makedirs(log_dir, exist_ok=True)
 
             if bec != "CURRENT":
                 raise ValueError("This simplified build is BCGW-only; set BEC to 'CURRENT'.")
@@ -301,6 +308,7 @@ class GARAnalysis:
         # Selected cells (UWR/WHA/LRMP) and working copies
         self.fc_gar_cells        = os.path.join(self.output_fd, f"{self.gar.replace('-', '')}_UWR")
         self.fc_gar_cells_erase  = os.path.join(self.scratch_gdb, 'gar_cells_erase')
+        self.fc_u8008_overlap = os.path.join(self.scratch_gdb, 'u8008_overlap') # the u-8007 order says U-8-008 takes precedence here
 
         # BCGW layers clipped to AOI/cells
         self.fc_lu               = os.path.join(self.scratch_gdb, 'lu')
@@ -383,6 +391,11 @@ class GARAnalysis:
                 path=self.__woodlots,
                 sql="LIFE_CYCLE_STATUS_CODE = 'ACTIVE'",
                 output=self.fc_woodlots
+            ),
+            'u8008_overlap': GARInput(
+                path=self.__uwr,
+                sql="UWR_NUMBER = 'u-8-008'",
+                output=self.fc_u8008_overlap
             ),
             'lu': GARInput(
                 path=self.__lu,
@@ -659,6 +672,49 @@ class GARAnalysis:
                 gar=self.gar, output_xls=self.output_xls, logger=self.logger, gar_config=gar_config
             )
 
+        elif self.gar == 'u-8-007':
+            gar_config = GARConfig(
+                sql="UWR_NUMBER = 'u-8-007'",
+                cells=self.__uwr,
+                cell_field=self.fld_uwr_num,
+                aoi=self.fc_aoi_clean,
+                erase_fcs=[
+                    self.fc_woodlots,
+                    self.fc_u8008_overlap,
+                ],
+                identity_fcs=[
+                    self.fc_vri_clip,
+                ],
+            )
+
+            self.gar_class = Gar8007(
+                gar=self.gar,
+                output_xls=self.output_xls,
+                logger=self.logger,
+                gar_config=gar_config,
+            )
+
+        elif self.gar == 'u-8-008':
+            gar_config = GARConfig(
+                sql="UWR_NUMBER = 'u-8-008'",
+                cells=self.__uwr,
+                cell_field=self.fld_uwr_num,
+                aoi=self.fc_aoi_clean,
+                erase_fcs=[
+                    self.fc_woodlots,
+                ],
+                identity_fcs=[
+                    self.fc_bec,
+                    self.fc_vri_clip,
+                ],
+            )
+
+            self.gar_class = Gar8008(
+                gar=self.gar,
+                output_xls=self.output_xls,
+                logger=self.logger,
+                gar_config=gar_config,
+            )
 
         elif self.gar == 'u-8-012':
             gar_config = GARConfig(
